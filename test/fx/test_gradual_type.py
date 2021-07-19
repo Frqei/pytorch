@@ -1,6 +1,7 @@
 import unittest
 import torch
 from torch.fx import symbolic_trace
+from torch.fx.experimental.unify_refinements import infer_symbolic_types
 from torch.fx.tensor_type import TensorType, Dyn, is_consistent, is_more_precise
 from torch.fx.annotate import annotate
 from torch.fx.experimental.graph_gradual_typechecker import GraphTypeChecker, broadcast_types
@@ -818,6 +819,50 @@ class TypeCheckerTest(unittest.TestCase):
         g.type_check()
         for n1, n2 in zip(gm_static_with_types.graph.nodes, gm_run.graph.nodes):
             assert n1.type == TensorType(n2.meta['tensor_meta'].shape)
+
+        # apply shape inference to graph and check
+        # that the batch size is equal across all layers
+        infer_symbolic_types(gm_static)
+        batch_sizes = []
+        for n in gm_static.graph.nodes:
+            assert isinstance(n.type, TensorType)
+            batch_sizes.append(n.type.__args__[0])
+        assert (len(set(batch_sizes)) == 1)
+
+
+
+    def test_type_check_batch_norm_symbolic(self):
+        class BasicBlock(torch.nn.Module):
+
+            def __init__(self, inplanes, planes, norm_layer=None):
+                super(BasicBlock, self).__init__()
+                if norm_layer is None:
+                    norm_layer = torch.nn.BatchNorm2d
+                self.bn1 = norm_layer(planes)
+
+            def forward(self, x: Dyn):
+                identity = x
+                out: TensorType((2, 2, Dyn, 4)) = self.bn1(x)
+                out += identity
+                return out
+
+        B = BasicBlock(2, 2)
+        ast_rewriter = RewritingTracer()
+        graph = ast_rewriter.trace(B)
+        traced = GraphModule(ast_rewriter.root, graph, "gm")
+        tc = GraphTypeChecker({}, traced)
+        tc.type_check()
+
+        infer_symbolic_types(traced)
+
+        my_types = []
+
+        for n in graph.nodes:
+            my_types.append(n.type)
+
+        assert my_types[0] == my_types[1]
+        assert my_types[1] == my_types[2]
+        assert my_types[2] == my_types[3]
 
 
 if __name__ == '__main__':
